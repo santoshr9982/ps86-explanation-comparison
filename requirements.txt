@@ -1,7 +1,0 @@
-streamlit>=1.50
-groq>=0.30
-google-genai>=1.0
-textstat==0.7.4  # pinned: newer versions download NLTK data at runtime
-pandas>=2.0
-plotly>=5.20
-datasets>=2.19  # only needed for prepare_dataset.py
