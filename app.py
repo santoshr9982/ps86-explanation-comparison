@@ -239,7 +239,7 @@ if "run" in st.session_state:
             st.markdown(f"**{it['name']}**")
             rows = [{"Claim": r["claim"], "Verdict": ICON[r["verdict"]], "Evidence from reference": r["evidence"],
                      "Correction": r["correction"]} for r in it["accuracy"]["results"]]
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.table(pd.DataFrame(rows).set_index("Claim") if rows else pd.DataFrame({"Claim": ["(no claims)"]}).set_index("Claim"))
         acc_df = pd.DataFrame({"Explanation": [i["name"] for i in items],
                                "Accuracy (%)": [i["accuracy"]["accuracy"] or 0 for i in items]})
         st.plotly_chart(px.bar(acc_df, x="Explanation", y="Accuracy (%)", range_y=[0, 100], text="Accuracy (%)",
@@ -251,7 +251,7 @@ if "run" in st.session_state:
             "flesch_reading_ease": "Flesch ease (higher = easier)", "grade_level": "Grade level", "words": "Words",
             "sentences": "Sentences", "avg_sentence_length": "Avg sentence length",
             "difficult_words": "Difficult words", "label": "Readability"})
-        st.dataframe(rdf, hide_index=True, width="stretch")
+        st.table(rdf.set_index("Explanation"))
         st.plotly_chart(px.bar(rdf, x="Explanation", y="Flesch ease (higher = easier)", range_y=[0, 100],
                                text="Flesch ease (higher = easier)", title="Flesch Reading Ease"), width="stretch")
         best_a = max(items, key=lambda i: i["accuracy"]["accuracy"] or 0)
