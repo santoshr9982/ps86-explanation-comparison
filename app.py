@@ -56,11 +56,11 @@ def secret(name):
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-    for key, label in [("GROQ_API_KEY", "Groq API key"), ("GEMINI_API_KEY", "Gemini API key")]:
+    for key, key_name in [("GROQ_API_KEY", "Groq API key"), ("GEMINI_API_KEY", "Gemini API key")]:
         if secret(key):
-            st.success(f"{label} loaded")
+            st.success(f"{key_name} loaded")
         else:
-            st.session_state[key] = st.text_input(label, type="password")
+            st.session_state[key] = st.text_input(key_name, type="password")
     groq_model = st.selectbox("Generator (Groq)", GROQ_MODELS)
     gemini_model = st.selectbox("Judge (Gemini)", GEMINI_MODELS)
     styles = st.multiselect("Explanation styles", list(STYLES), default=list(STYLES))
