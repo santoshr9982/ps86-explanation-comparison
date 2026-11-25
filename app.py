@@ -11,10 +11,11 @@ import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types as gtypes
 from groq import Groq
 
 from generator import GROQ_MODELS, STYLES, generate
-from judge import GEMINI_MODELS, extract_claims, verify
+from judge import GEMINI_MODELS, extract_claims, reset_judge, verify
 from readability import readability
 from report_export import to_docx, to_pdf
 from reference_loader import build_reference, chunk, label, load_file, load_url, retrieve
@@ -22,6 +23,11 @@ from reference_loader import build_reference, chunk, label, load_file, load_url,
 load_dotenv()  # reads GROQ_API_KEY / GEMINI_API_KEY from the .env file
 
 st.set_page_config(page_title="PS 86 - Explanation Comparison", page_icon="🔬", layout="wide")
+
+MAX_FILE_MB = 10
+MAX_FILES = 5
+MAX_QUESTION_CHARS = 300
+MAX_REF_CHARS = 12000
 
 # Used only if samples.csv has not been created yet (run prepare_dataset.py to build it from SciQ)
 DEMO_SAMPLES = [
@@ -66,13 +72,28 @@ with st.sidebar:
         else:
             st.session_state[key] = st.text_input(key_name, type="password")
     groq_model = st.selectbox("Generator (Groq)", GROQ_MODELS)
-    gemini_model = st.selectbox("Judge (Gemini)", GEMINI_MODELS)
+    judge_mode = st.radio("Judge", ["Auto: Gemini, then Groq backup", "Groq only (fast)"],
+                          help="Use 'Groq only' if Gemini is slow or out of quota.")
+    gemini_model = st.selectbox("Judge model (Gemini)", GEMINI_MODELS)
     styles = st.multiselect("Explanation styles", list(STYLES), default=list(STYLES))
     st.caption("**Accuracy**: Gemini extracts claims and checks each against the reference (temperature 0).\n\n"
                "**Readability**: Flesch formulas via textstat. No LLM.\n\nThe two scores are never combined.")
+    with st.expander("🛡️ Responsible AI safeguards"):
+        st.markdown(
+            "- **Separate scores**: accuracy (AI judge) and readability (formula) are never combined\n"
+            "- **No self-grading**: a different model family judges than the one that writes\n"
+            "- **Evidence required**: a verdict whose quote is not in the reference is shown as *unverified*\n"
+            "- **Low-confidence flags** when the reference does not cover most claims\n"
+            "- **Transparency**: the judge model used and the reference passages are always shown\n"
+            "- **Scope guard**: non-science or harmful questions are refused\n"
+            "- **Prompt-injection guard**: text inside references is treated as data, not instructions\n"
+            "- **Input limits**: question length, file size and number of files\n"
+            "- **Privacy**: nothing is stored; uploads stay in memory for this session only; keys stay in `.env`")
 
 st.title("🔬 Academic Explanation Comparison Platform")
 st.caption("PS 86 · Generate alternative explanations and compare **factual accuracy** and **readability**, reported separately.")
+st.info("**Educational aid, not an authority.** Verdicts are only as reliable as the reference you provide, and AI "
+        "judges can make mistakes. Check important facts with your teacher or textbook.", icon="ℹ️")
 
 # ---------------------------------------------------------------- input modes
 samples, source = load_samples()
@@ -104,12 +125,20 @@ else:
 own = st.text_area("Optional: paste your own explanation to evaluate (e.g. a student's answer)", height=80)
 
 if st.button("Generate & Compare", type="primary", width="stretch"):
-    if not (secret("GROQ_API_KEY") and secret("GEMINI_API_KEY")):
-        st.error("Add both API keys in the sidebar."); st.stop()
+    if not secret("GROQ_API_KEY") or (judge_mode.startswith("Auto") and not secret("GEMINI_API_KEY")):
+        st.error("Add the API keys in the sidebar (Gemini is only needed in Auto mode)."); st.stop()
     passages = []
     if mode.startswith("Mode 2") and (uploads or urls):
         if not question.strip():
             st.error("Enter the question first, so the right passages can be found."); st.stop()
+        if uploads and len(uploads) > MAX_FILES:
+            st.error(f"Please upload at most {MAX_FILES} files."); st.stop()
+        too_big = [f.name for f in uploads or [] if f.size > MAX_FILE_MB * 1024 * 1024]
+        if too_big:
+            st.error(f"Files over {MAX_FILE_MB} MB are not allowed: {', '.join(too_big)}"); st.stop()
+        bad_urls = [u for u in urls if not u.lower().startswith(("http://", "https://"))]
+        if bad_urls:
+            st.error(f"Links must start with http:// or https:// : {', '.join(bad_urls)}"); st.stop()
         docs = []
         for f in uploads or []:
             try:
@@ -128,19 +157,32 @@ if st.button("Generate & Compare", type="primary", width="stretch"):
         if not passages:
             st.error("Your sources don't seem to cover this question (no relevant passages found)."); st.stop()
         reference = build_reference(passages)
+    if len(question) > MAX_QUESTION_CHARS:
+        st.error(f"Question is too long (max {MAX_QUESTION_CHARS} characters)."); st.stop()
+    if len(reference) > MAX_REF_CHARS:
+        reference = reference[:MAX_REF_CHARS]
+        st.warning(f"Reference was long, so only the first {MAX_REF_CHARS} characters are used.")
     if not question.strip() or not reference.strip():
         st.error("A question and a reference are both required."); st.stop()
     if not styles and not own.strip():
         st.error("Choose at least one style or paste an explanation."); st.stop()
 
-    groq_client = Groq(api_key=secret("GROQ_API_KEY"))
-    gem_client = genai.Client(api_key=secret("GEMINI_API_KEY"))
+    groq_client = Groq(api_key=secret("GROQ_API_KEY"), timeout=40, max_retries=1)
+    gem_client = None if judge_mode.startswith("Groq") else genai.Client(
+        api_key=secret("GEMINI_API_KEY"), http_options=gtypes.HttpOptions(timeout=25000))  # 25 s per call
+    reset_judge()
     items = []
     try:
         with st.status("Running pipeline...", expanded=True) as status:
             for s in styles:
                 st.write(f"✍️ Groq: generating **{s}** explanation (question only)")
-                items.append({"name": s, "text": generate(groq_client, question, s, groq_model)})
+                text = generate(groq_client, question, s, groq_model)
+                if text.strip().upper().startswith("NOT_SCIENCE"):
+                    status.update(label="Stopped", state="error")
+                    st.error("This doesn't look like a science or academic question (or it asks for unsafe content), "
+                             "so the app won't generate explanations for it.")
+                    st.stop()
+                items.append({"name": s, "text": text})
             if own.strip():
                 items.append({"name": "User-provided", "text": own.strip()})
             for it in items:
@@ -180,13 +222,19 @@ if "run" in st.session_state:
         used = sorted({i["accuracy"].get("judge_model", "") for i in items} - {""})
         st.caption("Judge vs. the reference. Writing style is ignored. Accuracy = supported claims / all claims. "
                    f"Judge model used: {', '.join(used) or 'n/a'}")
-        if any(u.startswith("groq:") for u in used):
+        if any(u.startswith("groq:") for u in used) and judge_mode.startswith("Auto"):
             st.warning("Gemini was unavailable (quota or high demand), so a different Groq model family judged instead.")
         for col, it in zip(st.columns(len(items)), items):
             a = it["accuracy"]
             with col:
                 st.metric(it["name"], "n/a" if a["accuracy"] is None else f"{a['accuracy']}%",
                           f"{a['contradicted']} contradicted", delta_color="inverse")
+                uncertain = a.get("not_in_reference", 0) + a.get("unverified", 0)
+                if a["total"] == 0:
+                    st.warning("No factual claims found to check.")
+                elif uncertain / a["total"] >= 0.5:
+                    st.warning(f"Low confidence: {uncertain} of {a['total']} claims are not covered by the "
+                               "reference or lack valid evidence. Add a fuller reference.")
         for it in items:
             st.markdown(f"**{it['name']}**")
             rows = [{"Claim": r["claim"], "Verdict": ICON[r["verdict"]], "Evidence from reference": r["evidence"],
