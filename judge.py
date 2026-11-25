@@ -36,10 +36,42 @@ def _parse(text: str) -> dict:
         return json.loads(m.group(0))
 
 
+_DISCOVERED = None
+
+
+def available_models(client: genai.Client) -> list:
+    """Ask the API which Gemini models THIS key can use for generateContent.
+    Flash models first (fast + free tier), stable before preview, newest version first."""
+    global _DISCOVERED
+    if _DISCOVERED is not None:
+        return _DISCOVERED
+    names = []
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            name = (m.name or "").replace("models/", "")
+            if "generateContent" in actions and name.startswith("gemini") and "embedding" not in name \
+                    and "image" not in name and "tts" not in name and "audio" not in name:
+                names.append(name)
+    except Exception:
+        names = []
+
+    def rank(n):
+        ver = re.findall(r"gemini-(\d+(?:\.\d+)?)", n)
+        return ("flash" not in n, "lite" in n, "preview" in n or "exp" in n,
+                -float(ver[0]) if ver else 0, n)
+
+    _DISCOVERED = sorted(set(names), key=rank)
+    return _DISCOVERED
+
+
 def _call(client: genai.Client, model: str, system: str, user: str) -> dict:
-    order = [model] + [m for m in GEMINI_MODELS if m != model]
-    last_error = None
-    for m in order:
+    order = []
+    for m in [model] + GEMINI_MODELS + available_models(client):
+        if m and m not in order:
+            order.append(m)
+    errors = []
+    for m in order[:8]:
         try:
             resp = client.models.generate_content(
                 model=m,
@@ -50,8 +82,8 @@ def _call(client: genai.Client, model: str, system: str, user: str) -> dict:
             )
             return _parse(resp.text)
         except Exception as e:
-            last_error = e
-    raise RuntimeError(f"All Gemini models failed: {last_error}")
+            errors.append(f"{m}: {str(e)[:120]}")
+    raise RuntimeError("All Gemini models failed. Tried -> " + " | ".join(errors))
 
 
 def extract_claims(client: genai.Client, text: str, model: str = GEMINI_MODELS[0]) -> list:
@@ -99,6 +131,8 @@ def verify(client: genai.Client, question: str, reference: str, claims: list, mo
 
 if __name__ == "__main__":
     import os
+    from dotenv import load_dotenv
+    load_dotenv()
     c = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     ref = ("Seasons are caused by the 23.5 degree tilt of Earth's axis, not by changes in distance from the Sun. "
            "The hemisphere tilted toward the Sun receives more direct sunlight and longer days, causing summer.")
