@@ -1,0 +1,8 @@
+streamlit>=1.50
+groq>=0.30
+google-genai>=1.0
+textstat==0.7.4  # pinned: newer versions download NLTK data at runtime
+setuptools<81  # textstat 0.7.4 needs pkg_resources, which newer setuptools removed
+pandas>=2.0
+plotly>=5.20
+datasets>=2.19  # only needed for prepare_dataset.py
