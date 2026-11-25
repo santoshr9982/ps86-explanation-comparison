@@ -90,17 +90,42 @@ def _gemini_once(client, m, system, user):
     return _parse(resp.text)
 
 
+_GROQ_AVAILABLE = None
+
+
+def groq_models(groq_client) -> list:
+    """Chat models THIS Groq key can use, best judges first. Falls back to GROQ_JUDGE_MODELS if listing fails."""
+    global _GROQ_AVAILABLE
+    if _GROQ_AVAILABLE is not None:
+        return _GROQ_AVAILABLE
+    try:
+        ids = [m.id for m in groq_client.models.list().data]
+    except Exception:
+        ids = []
+    skip = ("whisper", "guard", "tts", "playai", "orpheus", "compound", "prompt-guard", "safeguard")
+    ids = [i for i in ids if not any(k in i.lower() for k in skip)]
+
+    def rank(i):
+        i = i.lower()
+        small = any(k in i for k in ("8b", "instant", "mini", "1b", "3b"))
+        tier = 0 if any(k in i for k in ("qwen", "kimi", "70b", "llama-4")) else 1 if "120b" in i else 2 if "gpt-oss" in i else 3
+        return (small, tier, i)
+
+    _GROQ_AVAILABLE = sorted(ids, key=rank) or list(GROQ_JUDGE_MODELS)
+    return _GROQ_AVAILABLE
+
+
 def _groq_judge(groq_client, system, user):
     errors = []
-    for m in GROQ_JUDGE_MODELS:
+    for m in groq_models(groq_client)[:5]:
         try:
             resp = groq_client.chat.completions.create(
                 model=m, temperature=0, response_format={"type": "json_object"},
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
             text = re.sub(r"<think>.*?</think>", "", resp.choices[0].message.content or "", flags=re.DOTALL)
             return _parse(text), f"groq:{m}"
-        except Exception as e:
-            errors.append(f"groq:{m}: {str(e)[:100]}")
+        except Exception as e:  # 404 not available / 429 rate limit -> try the next model
+            errors.append(f"groq:{m}: {str(e)[:90]}")
     raise RuntimeError(" | ".join(errors))
 
 
