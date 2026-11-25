@@ -15,6 +15,8 @@ from groq import Groq
 from generator import GROQ_MODELS, STYLES, generate
 from judge import GEMINI_MODELS, extract_claims, verify
 from readability import readability
+from report_export import to_docx, to_pdf
+from reference_loader import build_reference, chunk, label, load_file, load_url, retrieve
 
 st.set_page_config(page_title="PS 86 - Explanation Comparison", page_icon="🔬", layout="wide")
 
@@ -82,13 +84,46 @@ if mode.startswith("Mode 1"):
         st.write(reference)
 else:
     question = st.text_input("Science question")
-    reference = st.text_area("Reference explanation (trusted source)", height=130)
+    ref_source = st.radio("Reference source", ["Type / paste notes", "Upload files (PDF, Word, TXT)", "Web link"],
+                          horizontal=True)
+    reference, uploads, urls = "", [], []
+    if ref_source.startswith("Type"):
+        reference = st.text_area("Reference explanation / supporting notes (trusted source)", height=130)
+    elif ref_source.startswith("Upload"):
+        uploads = st.file_uploader("Upload textbook chapters, notes or slides", type=["pdf", "docx", "txt", "md"],
+                                   accept_multiple_files=True)
+        st.caption("Long files are fine: the app picks the passages most relevant to the question (RAG).")
+    else:
+        urls = [u.strip() for u in st.text_area("Web link(s), one per line", height=80).splitlines() if u.strip()]
+        st.caption("Use trusted pages (e.g. NCERT, Britannica, Khan Academy). Some sites block automated reading.")
 
 own = st.text_area("Optional: paste your own explanation to evaluate (e.g. a student's answer)", height=80)
 
 if st.button("Generate & Compare", type="primary", width="stretch"):
     if not (secret("GROQ_API_KEY") and secret("GEMINI_API_KEY")):
         st.error("Add both API keys in the sidebar."); st.stop()
+    passages = []
+    if mode.startswith("Mode 2") and (uploads or urls):
+        if not question.strip():
+            st.error("Enter the question first, so the right passages can be found."); st.stop()
+        docs = []
+        for f in uploads or []:
+            try:
+                docs += load_file(f.name, f.getvalue())
+            except Exception as e:
+                st.warning(f"Could not read {f.name}: {e}")
+        for u in urls:
+            try:
+                docs += load_url(u)
+            except Exception as e:
+                st.warning(f"Could not read {u}: {e}")
+        if not docs:
+            st.error("No readable text found. Scanned PDFs (images) have no text layer - paste the notes instead.")
+            st.stop()
+        passages = retrieve(question, chunk(docs))
+        if not passages:
+            st.error("Your sources don't seem to cover this question (no relevant passages found)."); st.stop()
+        reference = build_reference(passages)
     if not question.strip() or not reference.strip():
         st.error("A question and a reference are both required."); st.stop()
     if not styles and not own.strip():
@@ -112,13 +147,20 @@ if st.button("Generate & Compare", type="primary", width="stretch"):
             status.update(label="Done", state="complete", expanded=False)
     except Exception as e:
         st.error(f"Pipeline error: {e}"); st.stop()
-    st.session_state["run"] = {"question": question, "reference": reference, "items": items,
+    st.session_state["run"] = {"question": question, "reference": reference, "items": items, "passages": passages,
                                "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
 # ---------------------------------------------------------------- results
 if "run" in st.session_state:
     run = st.session_state["run"]
     items = run["items"]
+
+    if run.get("passages"):
+        with st.expander(f"📚 Reference used: {len(run['passages'])} passages retrieved from your sources"):
+            for p in run["passages"]:
+                score = f" · relevance {p['score']}" if p.get("score") is not None else ""
+                st.markdown(f"**{label(p)}**{score}")
+                st.caption(p["text"])
 
     st.subheader("📄 Explanations side by side")
     for col, it in zip(st.columns(len(items)), items):
@@ -171,6 +213,10 @@ if "run" in st.session_state:
         lines += [f"| {i['name']} | {i['readability']['flesch_reading_ease']} | {i['readability']['grade_level']} | "
                   f"{i['readability']['label']} |" for i in items]
         report = "\n".join(lines)
-        st.download_button("Download report (.md)", report, "comparison_report.md")
-        st.download_button("Download raw results (.json)", json.dumps(run, indent=2), "comparison_results.json")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.download_button("📄 Word report (.docx)", to_docx(run), "comparison_report.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        c2.download_button("📕 PDF report (.pdf)", to_pdf(run), "comparison_report.pdf", mime="application/pdf")
+        c3.download_button("Markdown (.md)", report, "comparison_report.md")
+        c4.download_button("Raw results (.json)", json.dumps(run, indent=2), "comparison_results.json")
         st.markdown(report)
