@@ -9,6 +9,7 @@ from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from dotenv import load_dotenv
 from google import genai
 from groq import Groq
 
@@ -17,6 +18,8 @@ from judge import GEMINI_MODELS, extract_claims, verify
 from readability import readability
 from report_export import to_docx, to_pdf
 from reference_loader import build_reference, chunk, label, load_file, load_url, retrieve
+
+load_dotenv()  # reads GROQ_API_KEY / GEMINI_API_KEY from the .env file
 
 st.set_page_config(page_title="PS 86 - Explanation Comparison", page_icon="🔬", layout="wide")
 
@@ -50,7 +53,8 @@ def secret(name):
         v = st.secrets.get(name, "")
     except Exception:
         v = ""
-    return v or os.environ.get(name, "") or st.session_state.get(name, "")
+    # .env / environment first, then Streamlit secrets (for Streamlit Cloud), then the sidebar box
+    return os.environ.get(name, "") or v or st.session_state.get(name, "")
 
 
 # ---------------------------------------------------------------- sidebar
@@ -141,8 +145,8 @@ if st.button("Generate & Compare", type="primary", width="stretch"):
                 items.append({"name": "User-provided", "text": own.strip()})
             for it in items:
                 st.write(f"🔎 Gemini: extracting and verifying claims for **{it['name']}**")
-                claims = extract_claims(gem_client, it["text"], gemini_model)
-                it["accuracy"] = verify(gem_client, question, reference, claims, gemini_model)
+                claims = extract_claims(gem_client, it["text"], gemini_model, groq_client)
+                it["accuracy"] = verify(gem_client, question, reference, claims, gemini_model, groq_client)
                 it["readability"] = readability(it["text"])
             status.update(label="Done", state="complete", expanded=False)
     except Exception as e:
@@ -173,7 +177,11 @@ if "run" in st.session_state:
     ICON = {"supported": "✅ supported", "contradicted": "❌ contradicted",
             "not_in_reference": "❔ not in reference", "unverified": "⚠️ unverified evidence"}
     with t_acc:
-        st.caption("Gemini judge vs. the reference. Writing style is ignored. Accuracy = supported claims / all claims.")
+        used = sorted({i["accuracy"].get("judge_model", "") for i in items} - {""})
+        st.caption("Judge vs. the reference. Writing style is ignored. Accuracy = supported claims / all claims. "
+                   f"Judge model used: {', '.join(used) or 'n/a'}")
+        if any(u.startswith("groq:") for u in used):
+            st.warning("Gemini was unavailable (quota or high demand), so a different Groq model family judged instead.")
         for col, it in zip(st.columns(len(items)), items):
             a = it["accuracy"]
             with col:

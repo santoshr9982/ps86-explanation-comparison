@@ -4,6 +4,7 @@ reference. A different model family from the generator avoids self-evaluation bi
 Temperature 0 + JSON output keep verdicts consistent."""
 import json
 import re
+import time
 from google import genai
 from google.genai import types
 
@@ -65,29 +66,65 @@ def available_models(client: genai.Client) -> list:
     return _DISCOVERED
 
 
-def _call(client: genai.Client, model: str, system: str, user: str) -> dict:
+LAST_JUDGE = ""  # which model actually produced the last verdict (shown in the app)
+GROQ_JUDGE_MODELS = ["qwen/qwen3.6-27b", "openai/gpt-oss-120b"]  # fallback if Gemini is unavailable
+
+
+def _gemini_once(client, m, system, user):
+    resp = client.models.generate_content(
+        model=m,
+        contents=f"{system}\n\n{user}",  # instructions inside the message: works on every API version
+        config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"),
+    )
+    return _parse(resp.text)
+
+
+def _groq_judge(groq_client, system, user):
+    errors = []
+    for m in GROQ_JUDGE_MODELS:
+        try:
+            resp = groq_client.chat.completions.create(
+                model=m, temperature=0, response_format={"type": "json_object"},
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+            text = re.sub(r"<think>.*?</think>", "", resp.choices[0].message.content or "", flags=re.DOTALL)
+            return _parse(text), f"groq:{m}"
+        except Exception as e:
+            errors.append(f"groq:{m}: {str(e)[:100]}")
+    raise RuntimeError(" | ".join(errors))
+
+
+def _call(client, model, system, user, groq_client=None):
+    global LAST_JUDGE
     order = []
     for m in [model] + GEMINI_MODELS + available_models(client):
         if m and m not in order:
             order.append(m)
     errors = []
-    for m in order[:8]:
+    for m in order[:6]:
+        for attempt in range(2):
+            try:
+                out = _gemini_once(client, m, system, user)
+                LAST_JUDGE = m
+                return out
+            except Exception as e:
+                msg = str(e)
+                if "503" in msg and attempt == 0:   # server busy: wait and retry once
+                    time.sleep(2)
+                    continue
+                errors.append(f"{m}: {msg[:100]}")
+                break
+    if groq_client is not None:  # Gemini quota used up / unavailable: judge with a different Groq model family
         try:
-            resp = client.models.generate_content(
-                model=m,
-                contents=user,
-                config=types.GenerateContentConfig(
-                    system_instruction=system, temperature=0, response_mime_type="application/json"
-                ),
-            )
-            return _parse(resp.text)
+            out, used = _groq_judge(groq_client, system, user)
+            LAST_JUDGE = used
+            return out
         except Exception as e:
-            errors.append(f"{m}: {str(e)[:120]}")
-    raise RuntimeError("All Gemini models failed. Tried -> " + " | ".join(errors))
+            errors.append(str(e))
+    raise RuntimeError("All judge models failed. Tried -> " + " | ".join(errors))
 
 
-def extract_claims(client: genai.Client, text: str, model: str = GEMINI_MODELS[0]) -> list:
-    data = _call(client, model, EXTRACT_SYSTEM, f"EXPLANATION:\n{text}")
+def extract_claims(client: genai.Client, text: str, model: str = GEMINI_MODELS[0], groq_client=None) -> list:
+    data = _call(client, model, EXTRACT_SYSTEM, f"EXPLANATION:\n{text}", groq_client)
     return [c.strip() for c in data.get("claims", []) if isinstance(c, str) and c.strip()]
 
 
@@ -95,11 +132,13 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (s or "").lower())).strip()
 
 
-def verify(client: genai.Client, question: str, reference: str, claims: list, model: str = GEMINI_MODELS[0]) -> dict:
+def verify(client: genai.Client, question: str, reference: str, claims: list, model: str = GEMINI_MODELS[0],
+           groq_client=None) -> dict:
     if not claims:
         return {"results": [], "accuracy": None, "supported": 0, "contradicted": 0, "not_in_reference": 0, "total": 0}
     numbered = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(claims))
-    data = _call(client, model, VERIFY_SYSTEM, f"QUESTION:\n{question}\n\nREFERENCE:\n{reference}\n\nCLAIMS:\n{numbered}")
+    data = _call(client, model, VERIFY_SYSTEM, f"QUESTION:\n{question}\n\nREFERENCE:\n{reference}\n\nCLAIMS:\n{numbered}",
+                 groq_client)
     results = []
     ref_norm = _norm(reference)
     for r in data.get("results", []):
@@ -125,6 +164,7 @@ def verify(client: genai.Client, question: str, reference: str, claims: list, mo
         "results": results,
         "accuracy": round(100 * counts["supported"] / total, 1) if total else None,
         "total": total,
+        "judge_model": LAST_JUDGE,
         **counts,
     }
 
